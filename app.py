@@ -5,7 +5,8 @@ Interface gráfica (tkinter + matplotlib) sobre o núcleo de cálculo em control
 """
 import math
 import tkinter as tk
-from tkinter import ttk, messagebox
+import os
+from tkinter import ttk, messagebox, filedialog
 
 import numpy as np
 import matplotlib
@@ -160,9 +161,16 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(TITULO)
-        self.geometry("1360x820")
-        self.minsize(1100, 680)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{min(1400, sw - 40)}x{min(900, sh - 80)}+10+10")
+        self.minsize(min(1000, sw - 40), min(560, sh - 80))
+        if sh < 950:                      # tela baixa: abre maximizada
+            try:
+                self.state("zoomed")
+            except tk.TclError:
+                pass
         self.resultado = None
+        self.series = {"r": None, "yd": None}
         self._estilo()
         self._monta_entrada()
         self._monta_saida()
@@ -181,35 +189,72 @@ class App(tk.Tk):
         st.configure("Treeview", rowheight=24, font=("Segoe UI", 10))
         st.configure("Treeview.Heading", font=("Segoe UI", 10, "bold"))
 
+    def _monta_painel_rolavel(self):
+        """Painel esquerdo: formulário com scroll vertical + rodapé fixo (botões sempre visíveis)."""
+        lado = ttk.Frame(self)
+        lado.pack(side=tk.LEFT, fill=tk.Y)
+        self._rodape = ttk.Frame(lado, padding=(10, 4, 10, 8))
+        self._rodape.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(lado, orient=tk.HORIZONTAL).pack(side=tk.BOTTOM, fill=tk.X)
+        area = ttk.Frame(lado)
+        area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        fundo = ttk.Style(self).lookup("TFrame", "background") or self.cget("bg")
+        canvas = tk.Canvas(area, highlightthickness=0, borderwidth=0, background=fundo)
+        sb = ttk.Scrollbar(area, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        esq = ttk.Frame(canvas, padding=10)
+        canvas.create_window((0, 0), window=esq, anchor="nw")
+
+        def ajusta(_=None):
+            canvas.configure(scrollregion=canvas.bbox("all"), width=esq.winfo_reqwidth())
+            if esq.winfo_reqheight() > canvas.winfo_height() > 1:
+                if not sb.winfo_ismapped():
+                    sb.pack(side=tk.RIGHT, fill=tk.Y)
+            elif sb.winfo_ismapped():
+                sb.pack_forget()
+                canvas.yview_moveto(0)
+
+        esq.bind("<Configure>", ajusta)
+        canvas.bind("<Configure>", ajusta)
+
+        def roda(ev):
+            if sb.winfo_ismapped():
+                canvas.yview_scroll(int(-ev.delta / 120) or (-1 if ev.delta > 0 else 1), "units")
+
+        area.bind("<Enter>", lambda e: self.bind_all("<MouseWheel>", roda))
+        area.bind("<Leave>", lambda e: self.unbind_all("<MouseWheel>"))
+        return esq
+
     def _monta_entrada(self):
-        esq = ttk.Frame(self, padding=10)
-        esq.pack(side=tk.LEFT, fill=tk.Y)
+        esq = self._monta_painel_rolavel()
 
         ttk.Label(esq, text="Rei do Controle", style="Titulo.TLabel").pack(anchor="w")
-        ttk.Label(esq, text="Projeto de controlador digital Gc(z)", style="Dica.TLabel").pack(anchor="w", pady=(0, 8))
+        ttk.Label(esq, text="Projeto de controlador digital Gc(z)", style="Dica.TLabel").pack(anchor="w", pady=(0, 4))
 
         # Planta
-        fp = ttk.LabelFrame(esq, text=" Planta ", padding=8)
-        fp.pack(fill=tk.X, pady=4)
-        ttk.Label(fp, text="G(s) =").grid(row=0, column=0, sticky="w")
+        fp = ttk.LabelFrame(esq, text=" Planta ", padding=(8, 4))
+        fp.pack(fill=tk.X, pady=2)
+        ttk.Label(fp, text="G(s) =  (ou G(z) =)").grid(row=0, column=0, sticky="w")
         self.var_G = tk.StringVar(value=EXEMPLO_G)
         eg = ttk.Entry(fp, textvariable=self.var_G, width=42, font=FONTE_MONO)
         eg.grid(row=1, column=0, columnspan=2, sticky="we", pady=2)
         ttk.Label(fp, text="Ex: 10*(s+2)/((s+1)*(s+5))  ·  2*e^(-0.5*s)/(3*s+1)\n"
+                           "Planta já discreta: use z, ex. (49.75*z + 44.97)/(z^2 - 0.852*z - 0.05611)\n"
                            "Multiplicação somente com * ; potência com ^ ; '.' = decimal.",
                   style="Dica.TLabel").grid(row=2, column=0, columnspan=2, sticky="w")
         ttk.Button(fp, text="Verificar G(s)", command=self.verifica_planta).grid(row=3, column=0, sticky="w", pady=(4, 0))
         self.lbl_planta = ttk.Label(fp, text="", font=("Consolas", 9), foreground="#1a5fb4", justify=tk.LEFT)
         self.lbl_planta.grid(row=4, column=0, columnspan=2, sticky="w")
 
-        ttk.Label(fp, text="Período de amostragem T (ms):").grid(row=5, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(fp, text="Período de amostragem T (ms):").grid(row=5, column=0, sticky="w", pady=(4, 0))
         self.var_T = tk.StringVar(value="100")
         ttk.Entry(fp, textvariable=self.var_T, width=10).grid(row=5, column=1, sticky="e", pady=(8, 0))
         fp.columnconfigure(0, weight=1)
 
         # Requisitos
-        fr = ttk.LabelFrame(esq, text=" Requisitos (deixe em branco o que não for pedido) ", padding=8)
-        fr.pack(fill=tk.X, pady=4)
+        fr = ttk.LabelFrame(esq, text=" Requisitos (deixe em branco o que não for pedido) ", padding=(8, 4))
+        fr.pack(fill=tk.X, pady=2)
         self.var_PO = tk.StringVar(value="10")
         self.var_tp = tk.StringVar(value="2")
         self.var_ts = tk.StringVar(value="")
@@ -220,12 +265,35 @@ class App(tk.Tk):
             ttk.Entry(fr, textvariable=var, width=10).grid(row=i, column=1, sticky="e", pady=2)
         self.var_erro = tk.BooleanVar(value=True)
         ttk.Checkbutton(fr, text="Erro estacionário nulo (entrada degrau)",
-                        variable=self.var_erro).grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+                        variable=self.var_erro).grid(row=3, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        self.var_amp = tk.StringVar(value="1")
+        self.var_ulim = tk.StringVar(value="")
+        ttk.Label(fr, text="Amplitude do degrau (UE):").grid(row=4, column=0, sticky="w", pady=(6, 2))
+        ttk.Entry(fr, textvariable=self.var_amp, width=10).grid(row=4, column=1, sticky="e", pady=(6, 2))
+        ttk.Label(fr, text="Limite de |u| (V) (opcional):").grid(row=5, column=0, sticky="w", pady=2)
+        ttk.Entry(fr, textvariable=self.var_ulim, width=10).grid(row=5, column=1, sticky="e", pady=2)
         fr.columnconfigure(0, weight=1)
 
+        # Sinais do TIA
+        fs = ttk.LabelFrame(esq, text=" Setpoint do TIA (opcional, .txt: 1 amostra por T) ", padding=(8, 4))
+        fs.pack(fill=tk.X, pady=2)
+        self.lbl_serie = {}
+        for i, (chave, rot) in enumerate((("r", "Setpoint r(k):"), ("yd", "Desejada yd(k):"))):
+            ttk.Label(fs, text=rot).grid(row=i, column=0, sticky="w", pady=1)
+            lbl = ttk.Label(fs, text="(nenhum)", style="Dica.TLabel", width=24)
+            lbl.grid(row=i, column=1, sticky="w", padx=4)
+            self.lbl_serie[chave] = lbl
+            ttk.Button(fs, text="Abrir...", width=7,
+                       command=lambda c=chave: self.carrega_serie(c)).grid(row=i, column=2, padx=1)
+            ttk.Button(fs, text="x", width=2,
+                       command=lambda c=chave: self.limpa_serie(c)).grid(row=i, column=3)
+        ttk.Label(fs, text="Sem yd: yd = T(z) desejada aplicada ao setpoint.", style="Dica.TLabel").grid(
+            row=2, column=0, columnspan=4, sticky="w")
+        fs.columnconfigure(1, weight=1)
+
         # Método
-        fm = ttk.LabelFrame(esq, text=" Método de projeto ", padding=8)
-        fm.pack(fill=tk.X, pady=4)
+        fm = ttk.LabelFrame(esq, text=" Método de projeto ", padding=(8, 4))
+        fm.pack(fill=tk.X, pady=2)
         self.var_met = tk.StringVar(value="LR")
         ttk.Radiobutton(fm, text="Lugar das Raízes (LR)", value="LR", variable=self.var_met,
                         command=self._atualiza_metodo).grid(row=0, column=0, columnspan=2, sticky="w")
@@ -240,31 +308,45 @@ class App(tk.Tk):
         self.rb_av.grid(row=3, column=0, columnspan=2, sticky="w", padx=(22, 0))
         ttk.Radiobutton(fm, text="Resposta em Frequência (RF) – avanço + Tustin", value="RF",
                         variable=self.var_met, command=self._atualiza_metodo).grid(row=4, column=0, columnspan=2,
-                                                                                    sticky="w", pady=(6, 0))
+                                                                                    sticky="w", pady=(3, 0))
         self.lbl_folga = ttk.Label(fm, text="Folga de fase (°):")
         self.lbl_folga.grid(row=5, column=0, sticky="w", padx=(22, 0))
         self.var_folga = tk.StringVar(value="5")
         self.ent_folga = ttk.Entry(fm, textvariable=self.var_folga, width=8)
         self.ent_folga.grid(row=5, column=1, sticky="e")
+        ttk.Radiobutton(fm, text="Síntese de FT: Gc = T / [G·(1 - T)]", value="SINT",
+                        variable=self.var_met, command=self._atualiza_metodo).grid(row=6, column=0, columnspan=2,
+                                                                                    sticky="w", pady=(3, 0))
+        ttk.Radiobutton(fm, text="Otimização (ISE) com limite de |u|", value="OTIM",
+                        variable=self.var_met, command=self._atualiza_metodo).grid(row=7, column=0, columnspan=2,
+                                                                                    sticky="w", pady=(3, 0))
+        self.lbl_ordem = ttk.Label(fm, text="Ordem do Gc:")
+        self.lbl_ordem.grid(row=8, column=0, sticky="w", padx=(22, 0))
+        self.var_ordem = tk.StringVar(value="2")
+        self.cb_ordem = ttk.Combobox(fm, textvariable=self.var_ordem, values=("1", "2"), width=5, state="readonly")
+        self.cb_ordem.grid(row=8, column=1, sticky="e")
+        self.var_suave = tk.BooleanVar(value=True)
+        self.ck_suave = ttk.Checkbutton(fm, text="Suavizar u (sem polos do Gc em Re < 0)", variable=self.var_suave)
+        self.ck_suave.grid(row=10, column=0, columnspan=2, sticky="w", padx=(22, 0))
         self.var_tia = tk.BooleanVar(value=True)
         ttk.Checkbutton(fm, text="Compatível com blocos GZ1/GZ2 do TIA (matched)",
-                        variable=self.var_tia).grid(row=6, column=0, columnspan=2, sticky="w", pady=(8, 0))
+                        variable=self.var_tia).grid(row=11, column=0, columnspan=2, sticky="w", pady=(4, 0))
         fm.columnconfigure(0, weight=1)
 
         # Botões
-        fb = ttk.Frame(esq)
-        fb.pack(fill=tk.X, pady=(10, 4))
+        fb = ttk.Frame(self._rodape)
+        fb.pack(fill=tk.X, pady=(2, 4))
         ttk.Button(fb, text="CALCULAR", style="Calc.TButton", command=self.calcula).pack(fill=tk.X)
-        fb2 = ttk.Frame(esq)
+        fb2 = ttk.Frame(self._rodape)
         fb2.pack(fill=tk.X)
         ttk.Button(fb2, text="Copiar Gc(z)", command=self.copia_gc).pack(side=tk.LEFT, expand=True, fill=tk.X)
         ttk.Button(fb2, text="Copiar relatório", command=self.copia_relatorio).pack(side=tk.LEFT, expand=True,
                                                                                     fill=tk.X, padx=4)
         ttk.Button(fb2, text="Limpar", command=self.limpa).pack(side=tk.LEFT, expand=True, fill=tk.X)
 
-        self.lbl_status = ttk.Label(esq, text="Preencha os dados e clique em CALCULAR.", wraplength=330,
+        self.lbl_status = ttk.Label(self._rodape, text="Preencha os dados e clique em CALCULAR.", wraplength=330,
                                     style="Dica.TLabel")
-        self.lbl_status.pack(anchor="w", pady=6)
+        self.lbl_status.pack(anchor="w", pady=(4, 0))
         self.bind("<Return>", lambda e: self.calcula())
 
     def _monta_saida(self):
@@ -329,8 +411,13 @@ class App(tk.Tk):
         lr = self.var_met.get() == "LR"
         for w in (self.rb_canc, self.rb_bis, self.rb_av):
             w.configure(state=tk.NORMAL if lr else tk.DISABLED)
-        self.ent_folga.configure(state=tk.DISABLED if lr else tk.NORMAL)
-        self.lbl_folga.configure(state=tk.DISABLED if lr else tk.NORMAL)
+        rf = self.var_met.get() == "RF"
+        otim = self.var_met.get() == "OTIM"
+        self.ent_folga.configure(state=tk.NORMAL if rf else tk.DISABLED)
+        self.lbl_folga.configure(state=tk.NORMAL if rf else tk.DISABLED)
+        self.cb_ordem.configure(state="readonly" if otim else tk.DISABLED)
+        self.lbl_ordem.configure(state=tk.NORMAL if otim else tk.DISABLED)
+        self.ck_suave.configure(state=tk.NORMAL if otim else tk.DISABLED)
 
     @staticmethod
     def _set_text(w, txt):
@@ -342,13 +429,32 @@ class App(tk.Tk):
     # ------------------------------------------------------------ ações
     def verifica_planta(self):
         try:
-            num, den, Td = ctl.parse_planta(self.var_G.get())
+            num, den, Td, var = ctl.parse_planta(self.var_G.get())
             polos = np.roots(den) if len(den) > 1 else []
-            txt = planta_str(num, den, Td)
+            txt = planta_str(num, den, Td) if var == "s" else fracao("G(z)", num, den, "z")
             txt += "\nPolos: " + ", ".join(ctl._c(p) if abs(p.imag) > 1e-12 else f"{p.real:.5g}" for p in polos)
             self.lbl_planta.configure(text=txt, foreground="#1a5fb4")
         except ctl.ErroProjeto as e:
             self.lbl_planta.configure(text=str(e), foreground="#c01c28")
+
+    def carrega_serie(self, chave):
+        caminho = filedialog.askopenfilename(
+            title="Abrir setpoint r(k)" if chave == "r" else "Abrir resposta desejada yd(k)",
+            filetypes=[("Texto", "*.txt *.csv *.dat"), ("Todos", "*.*")])
+        if not caminho:
+            return
+        try:
+            v = ctl.ler_serie(caminho)
+        except ctl.ErroProjeto as e:
+            messagebox.showerror("Arquivo inválido", str(e))
+            return
+        self.series[chave] = v
+        nome = os.path.basename(caminho)
+        self.lbl_serie[chave].configure(text=f"{nome[:14]}: {len(v)} pts [{v.min():g}..{v.max():g}]")
+
+    def limpa_serie(self, chave):
+        self.series[chave] = None
+        self.lbl_serie[chave].configure(text="(nenhum)")
 
     def limpa(self):
         for v in (self.var_G, self.var_PO, self.var_tp, self.var_ts):
@@ -385,10 +491,18 @@ class App(tk.Tk):
             tp = _num(self.var_tp.get(), "Tempo de pico")
             ts = _num(self.var_ts.get(), "Tempo de acomodação")
             folga = _num(self.var_folga.get(), "Folga de fase") or 0.0
+            amp = _num(self.var_amp.get(), "Amplitude do degrau") or 1.0
+            u_lim = _num(self.var_ulim.get(), "Limite de |u|")
+            if u_lim is not None and u_lim <= 0:
+                raise ctl.ErroProjeto("O limite de |u| deve ser positivo.")
+            if self.var_met.get() == "OTIM":
+                self.lbl_status.configure(text="Otimizando... (pode levar alguns segundos)")
             self.config(cursor="watch")
             self.update_idletasks()
             R = ctl.projeta(self.var_G.get(), T, PO, tp, ts, self.var_erro.get(),
-                            self.var_met.get(), self.var_sub.get(), folga, tia=self.var_tia.get())
+                            self.var_met.get(), self.var_sub.get(), folga, tia=self.var_tia.get(),
+                            ordem_otim=int(self.var_ordem.get()), amp=amp, u_lim=u_lim,
+                            suavizar=self.var_suave.get(), r_seq=self.series["r"], yd_seq=self.series["yd"])
         except ctl.ErroProjeto as e:
             self.config(cursor="")
             messagebox.showerror("Não foi possível projetar", str(e))
@@ -455,8 +569,24 @@ class App(tk.Tk):
         pm = np.max(np.abs(R["polos_mf"])) if len(R["polos_mf"]) else 0.0
         linhas.append(("Estabilidade (máx |polo MF|)", "< 1", _fmt(pm),
                        ("✓", "ok") if R["estavel"] else ("✗", "falha")))
-        linhas.append(("Esforço de controle máx |u| (V)", "—", _fmt(R["u_max"]), ("—", "")))
-        linhas.append(("Esforço de controle em regime u(∞) (V)", "—", _fmt(R["u_regime"]), ("—", "")))
+        A = R["amp"]
+        umax = R["u_max"] * A if np.isfinite(R["u_max"]) else np.nan
+        st = ("—", "")
+        if R["u_lim"]:
+            st = ("✓", "ok") if np.isfinite(umax) and umax <= R["u_lim"] * (1 + 1e-9) else ("✗", "falha")
+        linhas.append((f"Esforço máx |u| (V) p/ degrau de {A:g} UE",
+                       f"≤ {R['u_lim']:g}" if R["u_lim"] else "—", _fmt(umax), st))
+        if "u_max_r" in R:
+            ur = R["u_max_r"]
+            st = ("—", "")
+            if R["u_lim"]:
+                st = ("✓", "ok") if np.isfinite(ur) and ur <= R["u_lim"] * (1 + 1e-9) else ("✗", "falha")
+            linhas.append(("Esforço máx |u| (V) no setpoint do arquivo",
+                           f"≤ {R['u_lim']:g}" if R["u_lim"] else "—", _fmt(ur), st))
+        if "soma_erro" in R:
+            linhas.append(("SomaErro Σ(yd - y)² no setpoint", "mínimo", f"{R['soma_erro']:.6g}", ("—", "")))
+        linhas.append((f"u em regime (V) p/ degrau de {A:g} UE", "—",
+                       _fmt(R["u_regime"] * A if np.isfinite(R["u_regime"]) else np.nan), ("—", "")))
         linhas.append(("ζ desejado / ωn desejado (rad/s)", f"{req['zeta']:.4f} / {req['wn']:.4f}", "", ("", "")))
         if R["metodo"] == "RF" and "margens_s_zoh" in R:
             m = R["margens_s_zoh"]
@@ -474,10 +604,14 @@ class App(tk.Tk):
         L = []
         sep = "=" * 78
         L += [sep, "  REI DO CONTROLE - MEMÓRIA DE CÁLCULO", sep, ""]
-        L += ["[ PLANTA ]", planta_str(R["num_s"], R["den_s"], R["Td"]), ""]
-        if R["Td"] > 0:
-            L += [f"Atraso de transporte: Td = {R['Td']:g} s = {R['d_atraso']}·T + {R['theta_atraso']:.6g} s", ""]
-        L += [f"Discretização ZOH com T = {R['T'] * 1000:g} ms:", fracao("G(z)", R["num_z"], R["den_z"]), ""]
+        if R["discreto"]:
+            L += ["[ PLANTA ]", f"Planta informada em z (T = {R['T'] * 1000:g} ms):",
+                  fracao("G(z)", R["num_z"], R["den_z"]), ""]
+        else:
+            L += ["[ PLANTA ]", planta_str(R["num_s"], R["den_s"], R["Td"]), ""]
+            if R["Td"] > 0:
+                L += [f"Atraso de transporte: Td = {R['Td']:g} s = {R['d_atraso']}·T + {R['theta_atraso']:.6g} s", ""]
+            L += [f"Discretização ZOH com T = {R['T'] * 1000:g} ms:", fracao("G(z)", R["num_z"], R["den_z"]), ""]
         pz = np.roots(R["den_z"]) if len(R["den_z"]) > 1 else []
         n0 = sum(1 for p in pz if abs(p) < 1e-9)
         lista = [f"{ctl._c(p)} (|p|={abs(p):.4f})" for p in pz if abs(p) >= 1e-9]
@@ -495,9 +629,10 @@ class App(tk.Tk):
         for n in q["notas"]:
             L += ["  " + n]
         L += [""]
-        met = ("Lugar das Raízes - " + NOMES_LR.get(R["sub_metodo"], R["sub_metodo"])
-               if R["metodo"] == "LR" else "Resposta em Frequência - Avanço de fase + "
-               + ("matched" if R["tia"] else "Tustin"))
+        met = {"LR": "Lugar das Raízes - " + NOMES_LR.get(R["sub_metodo"], R["sub_metodo"]),
+               "RF": "Resposta em Frequência - Avanço de fase + " + ("matched" if R["tia"] else "Tustin"),
+               "SINT": "Síntese de FT de malha fechada: Gc = T/[G(1-T)]",
+               "OTIM": "Otimização ISE (evolução diferencial)"}[R["metodo"]]
         L += [f"[ PROJETO: {met} ]"]
         L += ["  " + p for p in R["passos"]]
         L += [""]
@@ -514,7 +649,14 @@ class App(tk.Tk):
               f"  Tempo de acomod.  : {_fmt(i['SettlingTime'])} s",
               f"  Valor de regime   : {_fmt(R['dc'])}",
               f"  Erro estacionário : {_fmt(R['ess'], 6)}",
-              f"  Esforço máx |u|   : {_fmt(R['u_max'])} V   (u em regime = {_fmt(R['u_regime'])} V)"]
+              f"  Esforço máx |u|   : {_fmt(R['u_max'] * R['amp'])} V   (u em regime = "
+              f"{_fmt(R['u_regime'] * R['amp'])} V) para degrau de {R['amp']:g} UE"]
+        if "y_r" in R:
+            L += ["", "[ SETPOINT DO ARQUIVO ]",
+                  f"  Amostras          : {len(R['r_seq'])}  ({len(R['r_seq']) * R['T']:g} s)",
+                  f"  Esforço máx |u|   : {_fmt(R.get('u_max_r', np.nan))} V"]
+            if "soma_erro" in R:
+                L += [f"  SomaErro Σ(yd-y)² : {R['soma_erro']:.6g}"]
         if R["metodo"] == "RF" and "margens_s" in R:
             mo, ms, mz = R["margens_orig"], R["margens_s"], R["margens_s_zoh"]
             L += ["", "[ MARGENS (BODE) ]",
@@ -548,8 +690,13 @@ class App(tk.Tk):
     def _mostra_graficos(self, R):
         fig = self.fig
         fig.clear()
-        gs = fig.add_gridspec(2, 2)
-        if R["metodo"] == "LR":
+        tem_r = "y_r" in R
+        gs = fig.add_gridspec(2, 3 if tem_r else 2)
+        if tem_r:
+            ax_r = fig.add_subplot(gs[0, 2])
+            self._plot_setpoint(ax_r, R)
+            self._plot_esforco(fig.add_subplot(gs[1, 2], sharex=ax_r), R, setpoint=True)
+        if R["metodo"] != "RF":
             self._plot_lgr(fig.add_subplot(gs[:, 0]), R)
         else:
             axm = fig.add_subplot(gs[0, 0])
@@ -560,19 +707,46 @@ class App(tk.Tk):
         fig.tight_layout()
         self.canvas.draw()
 
-    def _plot_esforco(self, ax, R):
-        t, u = R["t"], R["u"]
-        ax.step(t, u, where="post", color="#9467bd", lw=1.4, label="u = T(z)/G(z) · degrau")
-        if np.all(np.isfinite(u)) and len(u):
+    def _plot_setpoint(self, ax, R):
+        r = R["r_seq"]
+        t = np.arange(len(r)) * R["T"]
+        ax.step(t, r, where="post", color="#7f7f7f", lw=1.0, label="Setpoint r(k)")
+        if "yd_r" in R:
+            ax.step(t, R["yd_r"], where="post", color="#2ca02c", lw=1.2, ls="--", label="Desejada yd(k)")
+        if R["estavel"]:
+            ax.step(t, R["y_r"], where="post", color="#d62728", lw=1.4, label="y(k) com Gc(z)")
+        tit = "Setpoint do arquivo"
+        if "soma_erro" in R:
+            tit += f" (SomaErro = {R['soma_erro']:.4g})"
+        ax.set_title(tit, fontsize=9)
+        ax.set_ylabel("Saída (UE)")
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=7, loc="best")
+
+    def _plot_esforco(self, ax, R, setpoint=False):
+        A = 1.0 if setpoint else R["amp"]
+        if setpoint:
+            u = R["u_r"]
+            t = np.arange(len(u)) * R["T"]
+            rot = "u para o setpoint do arquivo"
+        else:
+            t, u = R["t"], R["u"] * A
+            rot = f"u = T(z)/G(z) · degrau de {A:g} UE"
+        ax.step(t, u, where="post", color="#9467bd", lw=1.4, label=rot)
+        if R["estavel"] and np.all(np.isfinite(u)) and len(u):
             i = int(np.argmax(np.abs(u)))
             ax.plot(t[i], u[i], "o", color="#d62728", ms=5)
             ax.annotate(f"máx |u| = {abs(u[i]):.4g} V  (t = {t[i]:.3g} s)", (t[i], u[i]),
                         textcoords="offset points", xytext=(8, -12 if u[i] > 0 else 8), fontsize=8,
                         color="#d62728")
-            if np.isfinite(R["u_regime"]):
-                ax.axhline(R["u_regime"], color="k", lw=0.7, ls="--",
-                           label=f"u em regime = {R['u_regime']:.4g} V")
-        ax.set_title("Esforço de controle (degrau unitário na referência)", fontsize=10)
+            if np.isfinite(R["u_regime"]) and not setpoint:
+                ax.axhline(R["u_regime"] * A, color="k", lw=0.7, ls="--",
+                           label=f"u em regime = {R['u_regime'] * A:.4g} V")
+        if R["u_lim"]:
+            for s in (1, -1):
+                ax.axhline(s * R["u_lim"], color="#c01c28", lw=1.0, ls=":",
+                           label=f"Limite ±{R['u_lim']:g} V" if s == 1 else None)
+        ax.set_title("Esforço u" + (" (setpoint)" if setpoint else " (degrau)"), fontsize=9)
         ax.set_xlabel("Tempo (s)")
         ax.set_ylabel("u (V)")
         ax.grid(True, alpha=0.3)
@@ -592,6 +766,8 @@ class App(tk.Tk):
             ax.plot(np.real(ol_z), np.imag(ol_z), "o", mfc="none", color="k", ms=7, mew=1.5, label="Zeros MA")
         zd = R["zd"]
         ax.plot([zd.real, zd.real], [zd.imag, -zd.imag], "*", color="red", ms=13, label="Polo desejado zd")
+        if R["metodo"] in ("SINT", "OTIM"):
+            ax.set_title("LR variando o ganho do Gc", fontsize=10)
         pmf = R["polos_mf"]
         ax.plot(pmf.real, pmf.imag, "s", mfc="none", color="#2ca02c", ms=8, mew=1.5, label="Polos MF")
         ax.axhline(0, color="#999", lw=0.5)
@@ -599,7 +775,8 @@ class App(tk.Tk):
         ax.set_xlim(-1.5, 1.5)
         ax.set_ylim(-1.5, 1.5)
         ax.set_aspect("equal", adjustable="box")
-        ax.set_title("Lugar das Raízes no plano z")
+        if R["metodo"] == "LR":
+            ax.set_title("Lugar das Raízes no plano z")
         ax.set_xlabel("Real")
         ax.set_ylabel("Imaginário")
         ax.grid(True, alpha=0.3)
@@ -635,11 +812,14 @@ class App(tk.Tk):
         axf.legend(fontsize=7)
 
     def _plot_degrau(self, ax, R):
-        t, y = R["t"], R["y"]
+        A = R["amp"]
+        t, y = R["t"], R["y"] * A
         if "t_cont" in R:
-            ax.plot(R["t_cont"], R["y_cont"], color="#1f77b4", lw=1.2, label="Contínuo projetado (s)")
+            ax.plot(R["t_cont"], R["y_cont"] * A, color="#1f77b4", lw=1.2, label="Contínuo projetado (s)")
+        if "y_des" in R:
+            ax.step(t, R["y_des"] * A, where="post", color="#2ca02c", lw=1.2, ls="--", label="Desejada yd = T(z)")
         ax.step(t, y, where="post", color="#d62728", lw=1.4, label="Digital Gc(z)·G(z)")
-        dc = R["dc"]
+        dc = R["dc"] * A if np.isfinite(R["dc"]) else np.nan
         if R["estavel"] and np.isfinite(dc):
             ax.axhline(dc, color="k", lw=0.7)
             ax.axhspan(dc * 0.98, dc * 1.02, color="#2ca02c", alpha=0.12, label="Faixa ±2%")
@@ -652,13 +832,12 @@ class App(tk.Tk):
                 ax.axvline(ri["tp"], color="#9467bd", lw=0.8, ls="--", label="tp desejado")
             i = R["info"]
             if np.isfinite(i["PeakTime"]) and i["Overshoot"] > 0.5:
-                ax.plot(i["PeakTime"], i["Peak"], "o", color="#d62728", ms=5)
-            # janela de tempo: até ~1,5x o maior entre ts obtido e desejado
+                ax.plot(i["PeakTime"], i["Peak"] * A, "o", color="#d62728", ms=5)
             tmax = max([v for v in (i["SettlingTime"], ri["ts"], ri["tp"], R["req"]["ts"])
                         if v is not None and np.isfinite(v)] + [5 * R["T"]]) * 1.6
             ax.set_xlim(0, min(tmax, t[-1]))
-        ax.set_title("Resposta ao degrau unitário em malha fechada", fontsize=10)
-        ax.set_ylabel("Saída")
+        ax.set_title(f"Degrau de {A:g} UE (malha fechada)", fontsize=9)
+        ax.set_ylabel("Saída (UE)")
         ax.grid(True, alpha=0.3)
         ax.legend(fontsize=7, loc="lower right")
 

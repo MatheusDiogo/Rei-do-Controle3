@@ -17,6 +17,7 @@ from scipy.linalg import expm
 
 TOL_INTEGRADOR_S = 1e-6   # |p| abaixo disso em s é tratado como integrador
 TOL_INTEGRADOR_Z = 1e-6   # |p - 1| abaixo disso em z é tratado como integrador
+_VAR_PLANTA = "s"         # variável da planta em análise pelo parser ('s' ou 'z')
 
 
 class ErroProjeto(Exception):
@@ -107,6 +108,8 @@ def _exponencial(x):
     """e^(x): número comum, ou atraso de transporte quando x = -Td·s."""
     if not isinstance(x, Racional):
         return math.exp(x)
+    if _VAR_PLANTA == "z":
+        raise ErroProjeto("Em G(z) o atraso é escrito como potência de z, por exemplo z^-3.")
     num, den = _limpa(x.num), _limpa(x.den)
     linear = (len(den) == 1 and len(num) == 2 and abs(num[1]) <= 1e-12 * abs(num[0]) and x.atraso == 0)
     if not linear:
@@ -126,11 +129,12 @@ def _avalia_ast(no):
     if isinstance(no, ast.Num):  # Python < 3.8
         return float(no.n)
     if isinstance(no, ast.Name):
-        if no.id == "s":
+        if no.id == _VAR_PLANTA:
             return Racional([1.0, 0.0])
         if no.id == "e":
             raise ErroProjeto("Use 'e' apenas como e^(-Td*s) para o atraso de transporte.")
-        raise ErroProjeto(f"Variável desconhecida em G(s): '{no.id}'. Use apenas 's'.")
+        raise ErroProjeto(f"Variável desconhecida em G: '{no.id}'. Use 's' (planta contínua) "
+                          "ou 'z' (planta já discretizada).")
     if isinstance(no, ast.UnaryOp) and isinstance(no.op, (ast.USub, ast.UAdd)):
         v = _avalia_ast(no.operand)
         return -v if isinstance(no.op, ast.USub) else v
@@ -166,7 +170,8 @@ def parse_planta(texto):
     """
     Converte um texto como
         "G(s) = 15.436 * e^(-0.82424*s) / (8.7953*s + 1)"
-    em (num, den, Td) com den mônico e Td = atraso de transporte (s).
+    em (num, den, Td, var) com den mônico, Td = atraso de transporte (s) e var = 's' ou 'z'
+    (planta já discretizada, ex.: "(49.75*z + 44.97)/(z^2 - 0.852*z - 0.05611)").
     Multiplicação somente com '*'; potência com '^' ou '**'; '.' é sempre
     separador decimal (vírgula também é aceita como decimal).
     Atraso: e^(-Td*s) ou exp(-Td*s), multiplicando a G(s).
@@ -183,7 +188,15 @@ def parse_planta(texto):
     except SyntaxError:
         raise ErroProjeto(f"Não consegui interpretar G(s): '{texto}'.\n\n"
                           "Use '*' para toda multiplicação, por exemplo: 10*s, 2*(s+1), (s+1)*(s+2).")
-    r = Racional._conv(_avalia_ast(arvore))
+    global _VAR_PLANTA
+    nomes = {n.id for n in ast.walk(arvore) if isinstance(n, ast.Name)}
+    if "s" in nomes and "z" in nomes:
+        raise ErroProjeto("Use só 's' (planta contínua) ou só 'z' (planta discreta) na mesma expressão.")
+    _VAR_PLANTA = "z" if "z" in nomes else "s"
+    try:
+        r = Racional._conv(_avalia_ast(arvore))
+    finally:
+        var, _VAR_PLANTA = _VAR_PLANTA, "s"
     num, den = _limpa(r.num), _limpa(r.den)
     if not np.any(num):
         raise ErroProjeto("G(s) é identicamente zero.")
@@ -192,7 +205,38 @@ def parse_planta(texto):
     if r.atraso < -1e-12:
         raise ErroProjeto("O atraso total de G(s) é negativo (não causal).")
     k = den[0]
-    return num / k, den / k, max(r.atraso, 0.0)
+    return num / k, den / k, max(r.atraso, 0.0), var
+
+
+def ler_serie(caminho):
+    """
+    Lê uma série de amostras de um .txt (uma por linha, como copiado do TIA).
+    Aceita ponto ou vírgula decimal; com várias colunas (; tab espaço), usa a última.
+    """
+    try:
+        with open(caminho, encoding="utf-8-sig", errors="replace") as f:
+            linhas = f.read().splitlines()
+    except OSError as e:
+        raise ErroProjeto(f"Não consegui abrir o arquivo: {e}")
+    valores = []
+    for i, linha in enumerate(linhas, 1):
+        t = linha.strip()
+        if not t:
+            continue
+        tok = [x for x in t.replace(";", " ").replace("\t", " ").split(" ") if x][-1]
+        if "," in tok and "." not in tok:
+            tok = tok.replace(",", ".")
+        elif "," in tok and "." in tok:          # 1.234,5 -> 1234.5
+            tok = tok.replace(".", "").replace(",", ".")
+        try:
+            valores.append(float(tok))
+        except ValueError:
+            if not valores:                      # cabeçalho
+                continue
+            raise ErroProjeto(f"Linha {i} do arquivo não é um número: '{linha}'")
+    if len(valores) < 5:
+        raise ErroProjeto("O arquivo precisa ter pelo menos 5 amostras.")
+    return np.array(valores)
 
 
 # =========================================================================
@@ -493,23 +537,43 @@ def _avalia_candidato(R, cand):
     dc = ganho_dc_discreto(num_mf, den_mf) if estavel else np.nan
     t, y = resposta_degrau_discreta(num_mf, den_mf, T)
     info = stepinfo(t, y, dc) if estavel else stepinfo(t, y, np.nan)
+    # esforço de controle: U(z)/R(z) = T(z)/G(z) = Gc / (1 + Gc·G)
+    num_u = _limpa(np.polymul(cand["num_c"], R["den_z"]))
+    u = signal.lfilter(np.pad(num_u, (len(den_mf) - len(num_u), 0)), den_mf, np.ones(len(t)))
+    u_max = float(np.max(np.abs(u))) if estavel else np.nan
     cand.update({
         "num_L": numL, "den_L": denL, "num_mf": num_mf, "den_mf": den_mf,
         "polos_mf": polos, "estavel": estavel, "dc": dc, "t": t, "y": y, "info": info,
+        "num_u": num_u, "u": u, "u_max": u_max,
+        "u_regime": ganho_dc_discreto(num_u, den_mf) if estavel else np.nan,
         "custo": _custo(info, estavel, R["req_in"], R["req"], cand.get("complexidade", 0)),
     })
+    u_pico = u_max * R["amp"]
+    r = R.get("r_seq")
+    if r is not None:      # resposta e esforço para o setpoint do arquivo (já em UE)
+        y_r = signal.lfilter(np.pad(num_mf, (len(den_mf) - len(num_mf), 0)), den_mf, r)
+        u_r = signal.lfilter(np.pad(num_u, (len(den_mf) - len(num_u), 0)), den_mf, r)
+        cand.update({"y_r": y_r, "u_r": u_r, "u_max_r": float(np.max(np.abs(u_r))) if estavel else np.nan})
+        u_pico = cand["u_max_r"]
+    if R.get("u_lim") and estavel and u_pico > R["u_lim"]:
+        cand["custo"] += 2.0 * (u_pico / R["u_lim"] - 1.0)   # passa do limite de |u|
     if R.get("tia") and "zp" in cand and not representavel_matched(cand["zp"]):
         cand["custo"] += 5.0     # raiz real em z <= 0: não cabe nos blocos GZ (matched)
         cand["rotulo"] += " [fora dos blocos GZ]"
     return cand
 
 
-def projeta(G_texto, T, PO, tp, ts, erro_nulo, metodo, sub_metodo="bissetriz", folga=5.0, tia=False):
+def projeta(G_texto, T, PO, tp, ts, erro_nulo, metodo, sub_metodo="bissetriz", folga=5.0, tia=False,
+            ordem_otim=2, amp=1.0, u_lim=None, suavizar=True, r_seq=None, yd_seq=None):
     """
     Executa o projeto completo.
-      metodo: 'LR' ou 'RF'
+      metodo: 'LR', 'RF', 'SINT' (síntese de FT) ou 'OTIM' (otimização ISE)
       sub_metodo (LR): 'cancelamento', 'bissetriz' ou 'avanco'
       folga (RF): graus extras de margem de fase
+      ordem_otim (OTIM): ordem do Gc otimizado (1 ou 2)
+      r_seq: setpoint r(k) do arquivo (UE, uma amostra por T); yd_seq: resposta desejada yd(k) opcional
+      suavizar (OTIM): penaliza polos do Gc com parte real negativa (u oscilando a cada amostra)
+      amp: amplitude do degrau de referência (UE); u_lim: limite de |u| (V) ou None
       tia: controlador implementável nos blocos GZ1/GZ2 do TIA (que fazem c2d 'matched'):
            integrador 1/(z-1) no LR, variantes com raiz real em z <= 0 penalizadas
            e discretização matched (em vez de Tustin) no RF
@@ -519,11 +583,18 @@ def projeta(G_texto, T, PO, tp, ts, erro_nulo, metodo, sub_metodo="bissetriz", f
     """
     if T is None or T <= 0:
         raise ErroProjeto("Informe um período de amostragem T > 0.")
-    num_s, den_s, Td = parse_planta(G_texto)
+    num_s, den_s, Td, var = parse_planta(G_texto)
     req = processa_requisitos(PO, tp, ts)
     avisos = list(req["notas"])
-    num_z, den_z, d_atraso, theta = c2d_zoh_atraso(num_s, den_s, T, Td)
     passos = []
+    if var == "z":
+        if metodo == "RF":
+            raise ErroProjeto("O método RF precisa da planta contínua G(s). Com G(z) use LR, síntese ou otimização.")
+        num_z, den_z, d_atraso, theta = num_s, den_s, 0, 0.0
+        num_s = den_s = None
+        passos.append(f"Planta informada diretamente em z (amostrada com T = {T * 1000:g} ms).")
+    else:
+        num_z, den_z, d_atraso, theta = c2d_zoh_atraso(num_s, den_s, T, Td)
     if Td > 0:
         passos.append(f"Atraso de transporte Td = {Td:.6g} s = {d_atraso}·T + {theta:.6g} s  ->  "
                       f"G(z) inclui z^-{d_atraso}" + (" e o atraso fracionário (Z modificada)" if theta else ""))
@@ -532,11 +603,26 @@ def projeta(G_texto, T, PO, tp, ts, erro_nulo, metodo, sub_metodo="bissetriz", f
                           "os requisitos podem ser inatingíveis.")
 
     R = {
-        "T": T, "num_s": num_s, "den_s": den_s, "Td": Td, "num_z": num_z, "den_z": den_z,
+        "T": T, "num_s": num_s, "den_s": den_s, "Td": Td, "num_z": num_z, "den_z": den_z, "discreto": var == "z",
         "d_atraso": d_atraso, "theta_atraso": theta,
         "req": req, "req_in": {"PO": PO, "tp": tp, "ts": ts, "erro_nulo": erro_nulo},
         "metodo": metodo, "sub_metodo": sub_metodo, "avisos": avisos, "passos": passos, "tia": tia,
+        "amp": amp if amp else 1.0, "u_lim": u_lim,
     }
+    if yd_seq is not None and r_seq is None:
+        raise ErroProjeto("Para usar a resposta desejada yd(k) do arquivo, carregue também o setpoint r(k).")
+    if r_seq is not None:
+        r_seq = np.asarray(r_seq, float)
+        if yd_seq is not None:
+            yd_seq = np.asarray(yd_seq, float)
+            if len(yd_seq) != len(r_seq):
+                n = min(len(r_seq), len(yd_seq))
+                avisos.append(f"r(k) tem {len(r_seq)} amostras e yd(k) tem {len(yd_seq)}: usadas as {n} primeiras.")
+                r_seq, yd_seq = r_seq[:n], yd_seq[:n]
+        R["r_seq"], R["yd_seq"] = r_seq, yd_seq
+        passos.append(f"Setpoint do arquivo: {len(r_seq)} amostras ({len(r_seq) * T:g} s), "
+                      f"de {r_seq.min():g} a {r_seq.max():g} UE (sistema em repouso antes de k = 0)"
+                      + ("; resposta desejada yd(k) também do arquivo" if yd_seq is not None else ""))
     n_amostras = 2 * math.pi / (req["wd"] * T)
     if n_amostras < 8:
         avisos.append(f"Poucas amostras por ciclo amortecido ({n_amostras:.1f} < 8). "
@@ -544,6 +630,10 @@ def projeta(G_texto, T, PO, tp, ts, erro_nulo, metodo, sub_metodo="bissetriz", f
 
     if metodo == "LR":
         candidatos = _candidatos_lr(R, sub_metodo, erro_nulo)
+    elif metodo == "SINT":
+        candidatos = _candidatos_sintese(R)
+    elif metodo == "OTIM":
+        candidatos = _candidatos_otimizacao(R, ordem_otim, erro_nulo, suavizar)
     else:
         candidatos = _candidatos_rf(R, erro_nulo, folga)
     if not candidatos:
@@ -574,8 +664,11 @@ def projeta(G_texto, T, PO, tp, ts, erro_nulo, metodo, sub_metodo="bissetriz", f
                       f"Usada a variante: {melhor['rotulo']}.")
 
     for k in ("num_c", "den_c", "num_L", "den_L", "num_mf", "den_mf", "polos_mf",
-              "estavel", "dc", "t", "y", "info"):
+              "estavel", "dc", "t", "y", "info", "num_u", "u", "u_max", "u_regime"):
         R[k] = melhor[k]
+    for k in ("y_r", "u_r", "u_max_r"):
+        if k in melhor:
+            R[k] = melhor[k]
     for k, v in melhor.get("extra", {}).items():
         R[k] = v
     if not R["estavel"]:
@@ -583,14 +676,24 @@ def projeta(G_texto, T, PO, tp, ts, erro_nulo, metodo, sub_metodo="bissetriz", f
                       "Nenhuma variante testada estabilizou o sistema: tente o outro método, "
                       "outro T ou requisitos menos exigentes.")
     R["ess"] = 1.0 - R["dc"] if np.isfinite(R["dc"]) else np.nan
-
-    # esforço de controle: U(z)/R(z) = T(z)/G(z) = Gc / (1 + Gc·G)
-    num_u = _limpa(np.polymul(R["num_c"], R["den_z"]))
-    R["num_u"], R["den_u"] = num_u, R["den_mf"]
-    b = np.pad(num_u, (len(R["den_mf"]) - len(num_u), 0))
-    R["u"] = signal.lfilter(b, R["den_mf"], np.ones(len(R["t"])))
-    R["u_max"] = float(np.max(np.abs(R["u"]))) if R["estavel"] else np.nan
-    R["u_regime"] = ganho_dc_discreto(num_u, R["den_mf"]) if R["estavel"] else np.nan
+    R["den_u"] = R["den_mf"]
+    if "num_Td" in R:      # resposta desejada (síntese / otimização)
+        nT, dT = R["num_Td"], R["den_Td"]
+        R["y_des"] = signal.lfilter(np.pad(nT, (len(dT) - len(nT), 0)), dT, np.ones(len(R["t"])))
+    if r_seq is not None:
+        if R.get("yd_seq") is not None:
+            R["yd_r"] = R["yd_seq"]
+        elif "num_Td" in R:
+            nT, dT = R["num_Td"], R["den_Td"]
+            R["yd_r"] = signal.lfilter(np.pad(nT, (len(dT) - len(nT), 0)), dT, r_seq)
+        if "yd_r" in R and R["estavel"]:
+            R["soma_erro"] = float(np.sum((R["y_r"] - R["yd_r"]) ** 2))
+        u_pico, ref = R.get("u_max_r", np.nan), "setpoint do arquivo"
+    else:
+        u_pico, ref = R["u_max"] * R["amp"], f"degrau de {R['amp']:g} UE"
+    if u_lim and np.isfinite(u_pico) and u_pico > u_lim:
+        avisos.append(f"O esforço de controle passa do limite: máx |u| = {u_pico:.4g} V > {u_lim:g} V "
+                      f"({ref}). Relaxe os requisitos ou use a otimização com limite de |u|.")
 
     R["zp"] = melhor["zp"]
     R["blocos"] = divide_blocos(*R["zp"])
@@ -600,6 +703,17 @@ def projeta(G_texto, T, PO, tp, ts, erro_nulo, metodo, sub_metodo="bissetriz", f
         avisos.append("Este Gc(z) tem raiz real em z <= 0: não há G(s) equivalente para os blocos GZ1/GZ2 "
                       "(matched). Use os coeficientes b/a em um bloco de equação de diferenças.")
     return R
+
+
+def _polo_desejado(R):
+    """sd = -σ + jωd e zd = e^(sd·T), registrados em R e na memória de cálculo."""
+    req, T = R["req"], R["T"]
+    sd = complex(-req["sigma"], req["wd"])
+    zd = np.exp(sd * T)
+    R["sd"], R["zd"] = sd, zd
+    R["passos"].append(f"Polo desejado em s:  sd = {_c(sd)}")
+    R["passos"].append(f"Polo mapeado em z:   zd = e^(sd·T) = {_c(zd)}   (|zd| = {abs(zd):.4f})")
+    return zd
 
 
 def _integrador_z():
@@ -644,11 +758,7 @@ def _candidatos_lr(R, sub_metodo, erro_nulo):
     num_z, den_z = R["num_z"], R["den_z"]
     passos = R["passos"]
 
-    sd = complex(-req["sigma"], req["wd"])
-    zd = np.exp(sd * T)
-    R["sd"], R["zd"] = sd, zd
-    passos.append(f"Polo desejado em s:  sd = {_c(sd)}")
-    passos.append(f"Polo mapeado em z:   zd = e^(sd·T) = {_c(zd)}   (|zd| = {abs(zd):.4f})")
+    zd = _polo_desejado(R)
 
     num_i, den_i = np.array([1.0]), np.array([1.0])
     if erro_nulo:
@@ -963,6 +1073,225 @@ def _cand_rf(R, opc_pi, wc, MF_alvo, folga, atraso):
 
     return {"rotulo": rot, "num_c": num_cz, "den_c": den_cz, "passos": ps, "avisos": av,
             "complexidade": max(0, extra["estagios"] - 1), "extra": extra, "zp": zp}
+
+
+# =========================================================================
+# Síntese de FT de malha fechada e projeto por otimização (ISE)
+# =========================================================================
+def _t_desejada(R, zeros_incluidos=()):
+    """
+    T(z) desejada de 2ª ordem com polos em zd e zd*:
+        T(z) = K·Π(z - zi) / [z^k·(z² - 2·Re(zd)·z + |zd|²)],  K tal que T(1) = 1 (erro nulo).
+    k (atraso) garante grau relativo de T >= grau relativo de G (controlador causal).
+    """
+    zd = R["zd"]
+    den2 = np.array([1.0, -2 * zd.real, abs(zd) ** 2])
+    rel_g = len(_limpa(R["den_z"])) - len(_limpa(R["num_z"]))
+    n_inc = len(zeros_incluidos)
+    k = max(0, rel_g - 2 + n_inc)
+    num = np.real(np.poly(zeros_incluidos)) if n_inc else np.array([1.0])
+    den = np.polymul(den2, np.r_[1.0, np.zeros(k)])
+    n1 = np.polyval(num, 1.0)
+    if abs(n1) < 1e-12:
+        raise ErroProjeto("A planta tem zero em z = 1: não é possível ter erro estacionário nulo.")
+    return np.polyval(den, 1.0) / n1 * num, den, k
+
+
+def _candidatos_sintese(R):
+    """Gc(z) = T(z) / [G(z)·(1 - T(z))] (síntese direta / Ragazzini)."""
+    num_z, den_z, T = R["num_z"], R["den_z"], R["T"]
+    passos, avisos = R["passos"], R["avisos"]
+    zd = _polo_desejado(R)
+    passos.append("Síntese: escolhe-se T(z) e calcula-se Gc(z) = T(z) / [G(z)·(1 - T(z))]")
+    passos.append("T(1) = 1 garante erro estacionário nulo (o integrador aparece sozinho em 1 - T(z)).")
+
+    zs = list(np.roots(num_z)) if len(num_z) > 1 else []
+    ps = np.roots(den_z) if len(den_z) > 1 else np.array([])
+    if any(abs(p) > 1 + 1e-9 for p in ps):
+        avisos.append("A planta é instável: a síntese direta cancela os polos instáveis com zeros do Gc "
+                      "e a malha fica internamente instável. Prefira o LR ou a otimização.")
+    instaveis = [z for z in zs if abs(z) >= 1 - 1e-9]
+    if instaveis:
+        passos.append("Zeros da planta fora do círculo unitário são mantidos em T(z) (não podem ser cancelados): "
+                      + ", ".join(_c(z) for z in instaveis))
+    negativos = [z for z in zs if abs(z) < 1 - 1e-9 and abs(z.imag) < 1e-9 and z.real <= 1e-9]
+
+    variantes = [("síntese clássica (cancela os zeros estáveis da planta)", instaveis, 0)]
+    if negativos:
+        variantes.append(("síntese mantendo em T(z) os zeros da planta em z <= 0", instaveis + negativos, 0.2))
+    if zs and len(zs) > len(instaveis) + len(negativos):
+        variantes.append(("síntese mantendo todos os zeros da planta em T(z)", zs, 0.4))
+
+    cands = []
+    for rot, inc, compl in variantes:
+        nT, dT, k = _t_desejada(R, inc)
+        resto = list(zs)
+        for z in inc:
+            resto.pop(int(np.argmin([abs(z - r) for r in resto])))
+        dmn = _soma(dT, -nT)                                   # 1 - T  ->  (dT - nT)/dT
+        raizes_dmn = [1.0 if abs(r - 1) < 1e-7 else r for r in np.roots(dmn)]
+        K = nT[0] / num_z[0]
+        zc = [complex(p) if abs(np.imag(p)) > 1e-9 else float(np.real(p)) for p in ps]
+        pz = [complex(p) if abs(np.imag(p)) > 1e-9 else float(np.real(p)) for p in list(resto) + raizes_dmn]
+        # planta com integrador: o zero do Gc em z = 1 cancela o polo de (1 - T) em z = 1
+        for z1 in [z for z in zc if abs(z - 1) < TOL_INTEGRADOR_Z]:
+            p1 = next((p for p in pz if abs(p - 1) < TOL_INTEGRADOR_Z), None)
+            if p1 is None:
+                break
+            zc.remove(z1)
+            pz.remove(p1)
+        num_c = K * np.real(np.poly(zc)) if zc else np.array([K])
+        den_c = np.real(np.poly(pz)) if pz else np.array([1.0])
+        zp = (float(np.real(K)), zc, pz)
+        p_ = [f"T(z) desejada = {poly_str(nT)} / [{poly_str(dT)}]   (atraso z^-{k})" if k else
+              f"T(z) desejada = {poly_str(nT)} / [{poly_str(dT)}]",
+              f"  ganho {nT[0]:.6g} escolhido para T(1) = 1 (erro estacionário nulo)"]
+        if inc:
+            p_.append("  zeros da planta mantidos em T(z): " + ", ".join(_c(z) for z in inc))
+        p_.append("Gc(z) = T / [G·(1 - T)]  (os polos da planta viram zeros do Gc; "
+                  "os zeros cancelados da planta viram polos do Gc)")
+        av = []
+        for p in pz:
+            if abs(np.imag(p)) < 1e-9 and np.real(p) < -0.5:
+                av.append(f"Polo do controlador em z = {np.real(p):.4f} (perto de -1): u oscila a cada amostra "
+                          "(ringing). Considere a variante que mantém esse zero da planta em T(z).")
+        cands.append({"rotulo": rot, "num_c": _limpa(np.real(num_c)), "den_c": _limpa(np.real(den_c)),
+                      "passos": p_, "avisos": av, "complexidade": compl, "zp": zp,
+                      "extra": {"num_Td": nT, "den_Td": dT, "atraso_T": k, "Kc": abs(K),
+                                "num_c0": _limpa(np.real(num_c)) / abs(K), "den_c0": _limpa(np.real(den_c))}})
+    return cands
+
+
+def _candidatos_otimizacao(R, ordem, erro_nulo, suavizar=True):
+    """
+    Gc(z) de topologia fixa com coeficientes que minimizam o ISE entre a resposta ao degrau
+    em malha fechada y(k) e a desejada yd(k) (T(z) de 2ª ordem com os requisitos), com
+    restrições de estabilidade e de |u| (limite informado). Busca global por evolução
+    diferencial (equivale ao Solver com início múltiplo) e refinamento local.
+    """
+    from scipy.optimize import differential_evolution
+    num_z, den_z, T = R["num_z"], R["den_z"], R["T"]
+    passos, avisos = R["passos"], R["avisos"]
+    amp, u_lim = R["amp"], R["u_lim"]
+    zd = _polo_desejado(R)
+    if erro_nulo and _polos_integradores_z(den_z) > 0:
+        passos.append("Erro nulo: a planta já possui polo em z = 1 (tipo 1). Integrador não fixado no Gc.")
+        erro_nulo = False
+    if ordem not in (1, 2):
+        raise ErroProjeto("A ordem do controlador otimizado deve ser 1 ou 2.")
+
+    zs = np.roots(num_z) if len(num_z) > 1 else np.array([])
+    instaveis = [z for z in zs if abs(z) >= 1 - 1e-9]
+    nT, dT, k = _t_desejada(R, instaveis)
+    passos.append(f"T(z) desejada = {poly_str(nT)} / [{poly_str(dT)}]")
+    if R.get("r_seq") is not None:
+        r = R["r_seq"]
+        N = len(r)
+        if R.get("yd_seq") is not None:
+            yd = R["yd_seq"]
+            passos.append("Excitação r(k) e resposta desejada yd(k) dos arquivos")
+        else:
+            yd = signal.lfilter(np.pad(nT, (len(dT) - len(nT), 0)), dT, r)
+            passos.append("Excitação r(k) do arquivo; yd(k) = T(z) desejada aplicada a r(k)")
+        escala_y = float(np.max(np.abs(r))) or 1.0
+        fator_u = 1.0                               # u já sai em V (r em UE)
+        if N > 3000:
+            avisos.append(f"Setpoint com {N} amostras: a otimização pode demorar.")
+    else:
+        ts_ref = R["req_in"]["ts"] or R["req"]["ts"]
+        N = int(np.clip(np.ceil(2.0 * ts_ref / T), 30, 1500))
+        r = np.ones(N)
+        yd = signal.lfilter(np.pad(nT, (len(dT) - len(nT), 0)), dT, r)
+        escala_y, fator_u = 1.0, amp
+        passos.append("Excitação: degrau unitário (carregue um setpoint para otimizar sobre a sua trajetória)")
+    passos.append(f"Horizonte da otimização: N = {N} amostras ({N * T:g} s)")
+
+    # escala dos coeficientes do numerador pelo ganho da planta perto da banda desejada
+    g = abs(avalia(num_z, den_z, np.exp(1j * R["req"]["wn"] * T)))
+    escala = 1.0 / g if np.isfinite(g) and g > 1e-12 else 1.0
+    nb = ordem + 1
+    if erro_nulo:
+        topo = ("(b0·z + b1)/(z - 1)" if ordem == 1 else "(b0·z² + b1·z + b2)/[(z - 1)(z - p)]")
+        lim_den = [] if ordem == 1 else [(-0.98, 0.98)]
+    else:
+        topo = ("(b0·z + b1)/(z + a1)" if ordem == 1 else "(b0·z² + b1·z + b2)/(z² + a1·z + a2)")
+        lim_den = [(-1.5, 1.5)] if ordem == 1 else [(-2.5, 2.5), (-1.5, 1.5)]
+    passos.append(f"Topologia do controlador: Gc(z) = {topo}" + ("  (integrador fixo: erro nulo)" if erro_nulo else ""))
+
+    def monta(p):
+        b = np.asarray(p[:nb]) * escala
+        if erro_nulo:
+            a = np.array([1.0, -1.0]) if ordem == 1 else np.polymul([1.0, -1.0], [1.0, -p[nb]])
+        else:
+            a = np.r_[1.0, p[nb:nb + ordem]]
+        return b, a
+
+    def simula(b, a):
+        numL, denL = np.polymul(b, num_z), np.polymul(a, den_z)
+        dmf = _soma(denL, numL)
+        raizes = np.roots(dmf)
+        rmax = np.max(np.abs(raizes)) if raizes.size else 0.0
+        if rmax >= 0.995:
+            return None, None, rmax
+        y = signal.lfilter(np.pad(numL, (len(dmf) - len(numL), 0)), dmf, r)
+        nu = np.polymul(b, den_z)
+        u = signal.lfilter(np.pad(nu, (len(dmf) - len(nu), 0)), dmf, r)
+        return y, u, rmax
+
+    def objetivo(p):
+        b, a = monta(p)
+        y, u, rmax = simula(b, a)
+        if y is None:
+            return 1e3 * (1.0 + rmax)
+        J = float(np.mean((y - yd) ** 2)) / escala_y ** 2
+        if u_lim:
+            exc = max(0.0, float(np.max(np.abs(u))) * fator_u - u_lim) / u_lim
+            J += 10.0 * exc + 100.0 * exc ** 2
+        if suavizar:           # polo com parte real negativa: u alterna de sinal a cada amostra
+            J += 0.02 * sum(max(0.0, -r.real) for r in np.roots(a))
+        if R.get("tia"):       # raízes reais em z <= 0 não cabem nos blocos GZ (matched)
+            for r in list(np.roots(b) if len(_limpa(b)) > 1 else []) + list(np.roots(a)):
+                if abs(r.imag) < 1e-9 and r.real <= 1e-3:
+                    J += 0.05 * (1e-3 - r.real + 0.1)
+        return J
+
+    B = 10.0
+    for tentativa in range(3):
+        limites = [(-B, B)] * nb + lim_den
+        res = differential_evolution(objetivo, limites, seed=7, popsize=15, maxiter=250, tol=1e-10,
+                                     mutation=(0.5, 1.0), recombination=0.8, polish=True)
+        no_limite = any(abs(v) > 0.97 * B for v in res.x[:nb])
+        if not no_limite:
+            break
+        passos.append(f"Coeficiente travou no limite ±{B:g} (normalizado): limites ampliados.")
+        B *= 5
+    b, a = monta(res.x)
+    passos.append(f"Evolução diferencial: {res.nfev} avaliações, ISE médio final = {res.fun:.6g}")
+    if res.fun >= 1e3:
+        raise ErroProjeto("A otimização não encontrou nenhum controlador estável com esta topologia. "
+                          "Tente a outra ordem, desmarque/marque o erro nulo ou relaxe os requisitos.")
+
+    num_c, den_c = _limpa(b), _limpa(a)
+    K = num_c[0] / den_c[0]
+    zeros_c = list(np.roots(num_c)) if len(num_c) > 1 else []
+    if erro_nulo:
+        polos_c = [1.0] + ([float(res.x[nb])] if ordem == 2 else [])
+    else:
+        polos_c = list(np.roots(den_c))
+    fmt = lambda lst: [complex(r) if abs(np.imag(r)) > 1e-9 else float(np.real(r)) for r in lst]
+    nomes = ["b0", "b1", "b2"][:nb]
+    passos.append("Coeficientes ótimos: " + ", ".join(f"{n} = {v:.6g}" for n, v in zip(nomes, b))
+                  + ("" if not erro_nulo or ordem == 1 else f", p = {res.x[nb]:.6g}")
+                  + ("" if erro_nulo else ", " + ", ".join(f"a{i + 1} = {v:.6g}" for i, v in enumerate(a[1:]))))
+    if u_lim:
+        passos.append(f"Restrição: máx |u| <= {u_lim:g} V "
+                      + ("no setpoint do arquivo" if R.get("r_seq") is not None else f"para degrau de {amp:g} UE"))
+    if suavizar:
+        passos.append("Suavização: polos do Gc com parte real negativa penalizados (evita u oscilando)")
+    return [{"rotulo": f"otimização ISE, Gc de ordem {ordem}", "num_c": num_c, "den_c": den_c,
+             "passos": [], "avisos": [], "complexidade": 0, "zp": (float(K), fmt(zeros_c), fmt(polos_c)),
+             "extra": {"num_Td": nT, "den_Td": dT, "atraso_T": k, "ise": res.fun, "Kc": abs(K),
+                       "num_c0": num_c / abs(K), "den_c0": den_c}}]
 
 
 # =========================================================================
