@@ -359,9 +359,10 @@ def resposta_degrau_continua(num, den, t_final):
 
 
 def stepinfo(t, y, y_final, faixa=0.02):
-    """Equivalente ao stepinfo (sobressinal, tp, ts 2%, tr 10-90%)."""
+    """Equivalente ao stepinfo do MATLAB (ts com faixa de 2%, tr de 10 a 90%)."""
     info = {"Overshoot": np.nan, "PeakTime": np.nan, "SettlingTime": np.nan,
-            "RiseTime": np.nan, "Peak": np.nan}
+            "RiseTime": np.nan, "Peak": np.nan, "SettlingMin": np.nan, "SettlingMax": np.nan,
+            "Undershoot": np.nan}
     if not np.isfinite(y_final) or abs(y_final) < 1e-12 or not np.all(np.isfinite(y)):
         return info
     ys = y / y_final
@@ -378,6 +379,10 @@ def stepinfo(t, y, y_final, faixa=0.02):
     i90 = np.argmax(ys >= 0.9)
     if ys[i90] >= 0.9 and ys[i10] >= 0.1:
         info["RiseTime"] = t[i90] - t[i10]
+        info["SettlingMin"] = float(np.min(y[i90:]))   # após a subida
+        info["SettlingMax"] = float(np.max(y[i90:]))
+    info["Peak"] = float(np.max(np.abs(y)))
+    info["Undershoot"] = max(0.0, -float(np.min(ys)) * 100.0)
     return info
 
 
@@ -392,6 +397,68 @@ def fase_continua(num, den, w, atraso=0.0):
     if num[0] / den[0] < 0:
         fase -= np.pi
     return fase - w * atraso
+
+
+def fase_discreta(num, den, w, T):
+    """Fase (rad) de num/den em z = e^(jωT), contínua em ω (soma das fases de cada fator)."""
+    x = np.exp(1j * np.atleast_1d(w) * T)
+    fase = np.zeros(x.shape)
+    for z in (np.roots(num) if len(_limpa(num)) > 1 else []):
+        fase += np.angle(x - z)
+    for p in (np.roots(den) if len(_limpa(den)) > 1 else []):
+        fase -= np.angle(x - p)
+    if _limpa(num)[0] / _limpa(den)[0] < 0:
+        fase -= np.pi
+    return fase
+
+
+def margens_discretas(num, den, T):
+    """Margens de ganho/fase de L(z) = num/den avaliada em z = e^(jωT), 0 < ω < π/T (como margin do MATLAB)."""
+    num, den = _limpa(num), _limpa(den)
+    w = np.logspace(-5, math.log10(math.pi / T * 0.9999), 40000)
+    mag = np.abs(avalia(num, den, np.exp(1j * w * T)))
+    fase = fase_discreta(num, den, w, T)
+    res = {"Gm_dB": np.inf, "Wcg": np.nan, "Pm": np.inf, "Wcp": np.nan}
+    with np.errstate(divide="ignore"):
+        lm = np.log(mag)
+    idx = np.where(np.diff(np.sign(lm)) != 0)[0]
+    if idx.size:
+        i = idx[0]
+        f = lm[i] / (lm[i] - lm[i + 1])
+        wc = w[i] * (w[i + 1] / w[i]) ** f
+        res["Wcp"] = wc
+        res["Pm"] = math.degrees(fase_discreta(num, den, np.array([wc]), T)[0]) + 180.0
+    g = (fase + np.pi) / (2 * np.pi)
+    idx = np.where(np.diff(np.floor(g)) != 0)[0]
+    if idx.size:
+        i = idx[0]
+        res["Wcg"] = w[i]
+        res["Gm_dB"] = -20 * np.log10(mag[i])
+    return res
+
+
+def _graus_neg(a):
+    """Ângulo em graus no intervalo (-360°, 0°] (convenção de fase de malha)."""
+    g = math.degrees(a) % 360.0
+    return g - 360.0 if g > 1e-9 else 0.0
+
+
+def analise_projeto(R):
+    """Condição de ângulo em zd e margens discretas da planta e da malha compensada."""
+    T = R["T"]
+    zd = R.get("zd")
+    if zd is None:
+        zd = np.exp(complex(-R["req"]["sigma"], R["req"]["wd"]) * T)
+    G = avalia(R["num_z"], R["den_z"], zd)
+    Gc = avalia(R["num_c"], R["den_c"], zd)
+    phi = math.degrees(_wrap(-np.pi - np.angle(G)))
+    return {
+        "zd": zd,
+        "ang_G": _graus_neg(np.angle(G)), "ang_Gc": math.degrees(np.angle(Gc)),
+        "ang_L": _graus_neg(np.angle(G * Gc)), "mod_L": abs(G * Gc), "phi": phi,
+        "marg_G": margens_discretas(R["num_z"], R["den_z"], T),
+        "marg_L": margens_discretas(R["num_L"], R["den_L"], T),
+    }
 
 
 def margens(num, den, atraso=0.0, w=None):
@@ -697,6 +764,7 @@ def projeta(G_texto, T, PO, tp, ts, erro_nulo, metodo, sub_metodo="bissetriz", f
 
     R["zp"] = melhor["zp"]
     R["blocos"] = divide_blocos(*R["zp"])
+    R["analise"] = analise_projeto(R)
     for bl in R["blocos"]:
         bl["tia"] = parametros_tia(bl, T)
     if tia and not representavel_matched(R["zp"]):

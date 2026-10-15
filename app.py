@@ -157,6 +157,190 @@ def texto_resultado(R):
     return texto_tia(R) + "\n\n" + texto_controlador(R)
 
 
+DESCRICAO_METODO = {
+    "cancelamento": "O(s) zero(s) do Gc cancela(m) o(s) polo(s) mais lento(s) da planta; o polo do Gc sai da "
+                    "condição de ângulo em zd e o ganho, da condição de módulo.",
+    "bissetriz": "Zero e polo do Gc posicionados simetricamente em torno da bissetriz do ângulo de zd, "
+                 "compensando a defasagem φ; ganho pela condição de módulo.",
+    "avanco": "Zero do Gc diretamente abaixo de zd (zc = Re(zd)); polo pela condição de ângulo; "
+              "ganho pela condição de módulo.",
+    "RF": "Compensador de avanço de fase projetado no Bode para a MF e a ωc alvo (a partir de ζ e ωn) "
+          "e discretizado.",
+    "SINT": "Impõe-se a malha fechada T(z) desejada e calcula-se diretamente Gc = T / [G·(1 - T)].",
+    "OTIM": "Topologia do Gc fixada; coeficientes escolhidos por minimização de Σ(yd - y)² "
+            "(evolução diferencial), com restrições de estabilidade e de |u|.",
+}
+
+
+def _lista_raizes(raizes, Td=0.0):
+    """Raízes em texto, agrupando as que estão em z = 0."""
+    rs = list(np.atleast_1d(raizes))
+    n0 = sum(1 for r in rs if abs(r) < 1e-9)
+    itens = [ctl._c(r) if abs(np.imag(r)) > 1e-9 else f"{np.real(r):.6g}"
+             for r in sorted((r for r in rs if abs(r) >= 1e-9), key=lambda r: (-np.real(r), -np.imag(r)))]
+    if n0:
+        itens.append(f"0 (x{n0}{', do atraso' if Td > 0 else ''})")
+    return ", ".join(itens) if itens else "nenhum"
+
+
+def _margem_txt(m):
+    mg = "infinita" if not np.isfinite(m["Gm_dB"]) else f"{m['Gm_dB']:.2f} dB (ω = {m['Wcg']:.4g} rad/s)"
+    mf = "infinita" if not np.isfinite(m["Pm"]) else f"{m['Pm']:.2f}° (ω = {m['Wcp']:.4g} rad/s)"
+    return f"MG = {mg}   ·   MF = {mf}"
+
+
+def _stepinfo_txt(info, A):
+    """Bloco no formato do stepinfo do MATLAB, para degrau de amplitude A."""
+    campos = [("RiseTime", info["RiseTime"], 1), ("SettlingTime", info["SettlingTime"], 1),
+              ("SettlingMin", info["SettlingMin"], A), ("SettlingMax", info["SettlingMax"], A),
+              ("Overshoot", info["Overshoot"], 1), ("Undershoot", info["Undershoot"], 1),
+              ("Peak", info["Peak"], A), ("PeakTime", info["PeakTime"], 1)]
+    return [f"{n:>16}: {v * esc:.4f}" if v is not None and np.isfinite(v) else f"{n:>16}: —"
+            for n, v, esc in campos]
+
+
+def relatorio(R):
+    """Relatório objetivo do projeto, na ordem: planta, especificações, discretização, método,
+    análise angular e margens, controlador e resultados."""
+    T, q, ri, an = R["T"], R["req"], R["req_in"], R["analise"]
+    A = R["amp"]
+    met = {"LR": "Lugar das Raízes - " + NOMES_LR.get(R["sub_metodo"], R["sub_metodo"]),
+           "RF": "Resposta em Frequência - avanço de fase + " + ("matched" if R["tia"] else "Tustin"),
+           "SINT": "Síntese de FT de malha fechada",
+           "OTIM": "Otimização (ISE)"}[R["metodo"]]
+    sep = "=" * 78
+    L = [sep, "  PROJETO DE CONTROLADOR DIGITAL", f"  Método: {met}   ·   T = {T * 1000:g} ms", sep, ""]
+
+    # 1. Planta
+    L += ["1. PLANTA"]
+    if R["discreto"]:
+        L += [f"   Planta informada já discretizada (T = {T * 1000:g} ms) - ver item 3.", ""]
+    else:
+        L += [planta_str(R["num_s"], R["den_s"], R["Td"]), "",
+              "   Polos: " + _lista_raizes(np.roots(R["den_s"]) if len(R["den_s"]) > 1 else []),
+              "   Zeros: " + _lista_raizes(np.roots(R["num_s"]) if len(R["num_s"]) > 1 else [])]
+        if R["Td"] > 0:
+            L += [f"   Atraso de transporte: Td = {R['Td']:g} s"]
+        L += [""]
+
+    # 2. Especificações
+    def req(v, un):
+        return "—" if v is None else f"{v:g} {un}"
+    L += ["2. ESPECIFICAÇÕES",
+          f"   Overshoot ≤ {req(ri['PO'], '%')}   ·   tp ≤ {req(ri['tp'], 's')}   ·   ts (2%) ≤ {req(ri['ts'], 's')}",
+          f"   Erro estacionário nulo: {'sim' if ri['erro_nulo'] else 'não'}   ·   degrau de {A:g} UE"
+          + (f"   ·   |u| ≤ {R['u_lim']:g} V" if R["u_lim"] else ""),
+          f"   ζ = {q['zeta']:.4f}   ·   ωn = {q['wn']:.4f} rad/s   ·   ωd = {q['wd']:.4f} rad/s   ·   σ = {q['sigma']:.4f}",
+          f"   Polo desejado:  sd = {ctl._c(complex(-q['sigma'], q['wd']))}   ->   "
+          f"zd = e^(sd·T) = {ctl._c(an['zd'])}  (|zd| = {abs(an['zd']):.4f})"]
+    if R["metodo"] == "RF" and "MF_alvo" in R:
+        L += [f"   Alvos em frequência: MF = {R['MF_alvo']:.2f}°   ·   ωc = {R['wc_alvo']:.4f} rad/s"]
+    for n in q["notas"]:
+        L += ["   " + n]
+    if "r_seq" in R:
+        r = R["r_seq"]
+        L += [f"   Setpoint do arquivo: {len(r)} amostras ({len(r) * T:g} s), de {r.min():g} a {r.max():g} UE"
+              + ("; yd(k) do arquivo" if R.get("yd_seq") is not None else "")]
+    L += [""]
+
+    # 3. Discretização
+    L += ["3. DISCRETIZAÇÃO" + ("" if R["discreto"] else f" (ZOH, T = {T * 1000:g} ms)")]
+    if R["Td"] > 0:
+        L += [f"   Td = {R['d_atraso']}·T + {R['theta_atraso']:.6g} s  ->  z^-{R['d_atraso']}"
+              + (" + atraso fracionário (transformada Z modificada)" if R["theta_atraso"] else "")]
+    L += [fracao("G(z)", R["num_z"], R["den_z"]), "",
+          "   Polos: " + _lista_raizes(np.roots(R["den_z"]) if len(R["den_z"]) > 1 else [], R["Td"]),
+          "   Zeros: " + _lista_raizes(np.roots(R["num_z"]) if len(ctl._limpa(R["num_z"])) > 1 else []), ""]
+
+    # 4. Método
+    chave = R["sub_metodo"] if R["metodo"] == "LR" else R["metodo"]
+    L += [f"4. MÉTODO: {met}", "   " + DESCRICAO_METODO.get(chave, ""),
+          f"   Variante utilizada: {R['escolhido']['rotulo']}"]
+    omitir = ("Polo desejado", "Polo mapeado", "Atraso de transporte Td", "Planta informada", "Setpoint do arquivo",
+              "Margem de fase alvo", "Frequência de cruzamento alvo")
+    L += ["   - " + p.strip() for p in R["passos"] if not p.startswith(omitir)]
+    if R["metodo"] == "RF" and "num_cs" in R:
+        L += ["", fracao("C(s)", R["num_cs"], R["den_cs"], "s")]
+    L += [""]
+
+    # 5. Análise angular e margens
+    L += ["5. ANÁLISE ANGULAR E MARGENS",
+          f"   Em zd = {ctl._c(an['zd'])}:",
+          f"     ∠G(zd)      = {an['ang_G']:9.2f}°",
+          f"     Defasagem φ = {an['phi']:9.2f}°   (ângulo que o controlador precisa fornecer)",
+          f"     ∠Gc(zd)     = {an['ang_Gc']:9.2f}°",
+          f"     ∠Gc·G(zd)   = {an['ang_L']:9.2f}°   (condição de ângulo: -180°)",
+          f"     |Gc·G(zd)|  = {an['mod_L']:9.4f}    (condição de módulo: 1)",
+          "   Margens (resposta em frequência discreta, z = e^(jωT)):",
+          "     Sem controlador G(z):  " + _margem_txt(an["marg_G"]),
+          "     Com controlador Gc·G:  " + _margem_txt(an["marg_L"])]
+    if R["metodo"] in ("SINT", "OTIM"):
+        L += ["   Obs.: neste método zd é a referência dos requisitos; o Gc não é calculado pela condição de ângulo."]
+    if R["metodo"] == "LR" and R.get("integrador"):
+        L += ["   Obs.: Gc inclui o integrador do erro nulo; a deficiência φ do item 4 é a do compensador "
+              "(descontado o integrador)."]
+    if R["metodo"] == "RF" and "margens_s" in R:
+        ms, mz = R["margens_s"], R["margens_s_zoh"]
+        L += ["   Contínuo C(s)·G(s):    " + _margem_txt(ms),
+              "   C(s)·G(s) + ZOH (T/2): " + _margem_txt(mz)]
+    L += [""]
+
+    # 6. Controlador
+    L += ["6. CONTROLADOR CALCULADO", texto_controlador(R), "", texto_tia(R), ""]
+
+    # 7. Resultados
+    i = R["info"]
+    L += ["7. RESULTADOS (malha fechada digital)",
+          f"   stepinfo({A:g}·T(z))  (degrau de {A:g} UE):" if A != 1 else "   stepinfo(T(z)):"]
+    L += _stepinfo_txt(i, A)
+    L += ["",
+          f"   Valor de regime    : {_fmt(R['dc'] * A if np.isfinite(R['dc']) else np.nan)}   ·   "
+          f"erro estacionário = {_fmt(abs(R['ess']) * 100 if np.isfinite(R['ess']) else np.nan, 4)} %",
+          f"   Esforço de controle: máx |u| = {_fmt(R['u_max'] * A, 4)} V   ·   u em regime = "
+          f"{_fmt(R['u_regime'] * A, 4)} V" + (f"   (limite ±{R['u_lim']:g} V)" if R["u_lim"] else ""),
+          "   Polos de malha fechada: " + _lista_raizes(R["polos_mf"], R["Td"]),
+          f"   Estabilidade: {'estável' if R['estavel'] else 'INSTÁVEL'} "
+          f"(máx |polo| = {np.max(np.abs(R['polos_mf'])) if len(R['polos_mf']) else 0:.4f})"]
+    if "y_r" in R:
+        L += [f"   Setpoint do arquivo: máx |u| = {_fmt(R.get('u_max_r', np.nan), 4)} V"
+              + (f"   ·   SomaErro Σ(yd - y)² = {R['soma_erro']:.6g}" if "soma_erro" in R else "")]
+
+    def verif(nome, obtido, alvo, un):
+        if alvo is None:
+            return None
+        if not np.isfinite(obtido):
+            marca = "✗"
+        else:
+            marca = "✓" if obtido <= alvo * (1 + 1e-9) else ("≈" if obtido <= alvo * 1.1 else "✗")
+        return f"     {nome:<22} {_fmt(obtido, 4):>10} {un:<2} (≤ {alvo:g} {un})   {marca}"
+    sem_pico = np.isfinite(i["Overshoot"]) and i["Overshoot"] < 0.5
+    linhas = [verif("Overshoot", i["Overshoot"], ri["PO"], "%"),
+              None if sem_pico else verif("Tempo de pico", i["PeakTime"], ri["tp"], "s"),
+              verif("Tempo de acomodação", i["SettlingTime"], ri["ts"], "s"),
+              verif("|u| máx", (R["u_max_r"] if "u_max_r" in R else R["u_max"] * A), R["u_lim"], "V")]
+    if ri["erro_nulo"]:
+        ok = np.isfinite(R["ess"]) and abs(R["ess"]) < 1e-6
+        linhas.append(f"     {'Erro estacionário':<22} {_fmt(abs(R['ess']) * 100, 4):>10} %  (= 0)   {'✓' if ok else '✗'}")
+    linhas = [x for x in linhas if x]
+    if linhas:
+        L += ["   Verificação dos requisitos:"] + linhas
+
+    if R["avisos"]:
+        L += ["", "AVISOS"] + ["   • " + a for a in R["avisos"]]
+    if len(R["candidatos"]) > 1:
+        L += ["", "ANEXO - variantes avaliadas"]
+        for c in R["candidatos"]:
+            if "falha" in c:
+                L += [f"   - {c['rotulo']}: inviável ({c['falha']})"]
+            elif c["estavel"]:
+                ci = c["info"]
+                L += [f"   - {c['rotulo']}: PO = {_fmt(ci['Overshoot'], 2)} %, ts = {_fmt(ci['SettlingTime'], 3)} s"
+                      + ("   <== usada" if c is R["escolhido"] else "")]
+            else:
+                L += [f"   - {c['rotulo']}: instável" + ("   <== usada" if c is R["escolhido"] else "")]
+    return "\n".join(L)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -601,91 +785,8 @@ class App(tk.Tk):
         self._set_text(self.txt_av, "\n".join("• " + a for a in av) if av else "Nenhum aviso.")
 
     def _mostra_memoria(self, R):
-        L = []
-        sep = "=" * 78
-        L += [sep, "  REI DO CONTROLE - MEMÓRIA DE CÁLCULO", sep, ""]
-        if R["discreto"]:
-            L += ["[ PLANTA ]", f"Planta informada em z (T = {R['T'] * 1000:g} ms):",
-                  fracao("G(z)", R["num_z"], R["den_z"]), ""]
-        else:
-            L += ["[ PLANTA ]", planta_str(R["num_s"], R["den_s"], R["Td"]), ""]
-            if R["Td"] > 0:
-                L += [f"Atraso de transporte: Td = {R['Td']:g} s = {R['d_atraso']}·T + {R['theta_atraso']:.6g} s", ""]
-            L += [f"Discretização ZOH com T = {R['T'] * 1000:g} ms:", fracao("G(z)", R["num_z"], R["den_z"]), ""]
-        pz = np.roots(R["den_z"]) if len(R["den_z"]) > 1 else []
-        n0 = sum(1 for p in pz if abs(p) < 1e-9)
-        lista = [f"{ctl._c(p)} (|p|={abs(p):.4f})" for p in pz if abs(p) >= 1e-9]
-        if n0:
-            lista.append(f"0 (x{n0}{', vindos do atraso' if R['Td'] > 0 else ''})")
-        L += ["Polos de G(z): " + ", ".join(lista), ""]
-        q = R["req"]
-        L += ["[ REQUISITOS ]"]
-        ri = R["req_in"]
-        val = {k: ("—" if ri[k] is None else f"{ri[k]:g}") for k in ("PO", "tp", "ts")}
-        L += [f"  Entrada: PO = {val['PO']} %, tp = {val['tp']} s, ts(2%) = {val['ts']} s, "
-              f"erro nulo = {'sim' if ri['erro_nulo'] else 'não'}"]
-        L += [f"  ζ = {q['zeta']:.4f}    ωn = {q['wn']:.4f} rad/s    ωd = {q['wd']:.4f} rad/s    σ = {q['sigma']:.4f}"]
-        L += [f"  2ª ordem teórica: PO = {q['PO']:.2f} %, tp = {q['tp']:.4f} s, ts = {q['ts']:.4f} s"]
-        for n in q["notas"]:
-            L += ["  " + n]
-        L += [""]
-        met = {"LR": "Lugar das Raízes - " + NOMES_LR.get(R["sub_metodo"], R["sub_metodo"]),
-               "RF": "Resposta em Frequência - Avanço de fase + " + ("matched" if R["tia"] else "Tustin"),
-               "SINT": "Síntese de FT de malha fechada: Gc = T/[G(1-T)]",
-               "OTIM": "Otimização ISE (evolução diferencial)"}[R["metodo"]]
-        L += [f"[ PROJETO: {met} ]"]
-        L += ["  " + p for p in R["passos"]]
-        L += [""]
-        if R["metodo"] == "RF" and "num_cs" in R:
-            L += ["Controlador contínuo:", fracao("C(s)", R["num_cs"], R["den_cs"], "s"), ""]
-        L += ["[ CONTROLADOR DIGITAL ]", texto_controlador(R), "", texto_tia(R), ""]
-        L += ["[ MALHA FECHADA ]", fracao("T(z)", R["num_mf"], R["den_mf"]), ""]
-        L += ["  Polos: " + ", ".join(f"{ctl._c(p)} (|p|={abs(p):.4f})" for p in R["polos_mf"])]
-        i = R["info"]
-        L += ["", "[ STEPINFO - RESULTADO EM MALHA FECHADA DIGITAL ]",
-              f"  Sobressinal       : {_fmt(i['Overshoot'], 4)} %",
-              f"  Tempo de pico     : {_fmt(i['PeakTime'])} s",
-              f"  Tempo de subida   : {_fmt(i['RiseTime'])} s",
-              f"  Tempo de acomod.  : {_fmt(i['SettlingTime'])} s",
-              f"  Valor de regime   : {_fmt(R['dc'])}",
-              f"  Erro estacionário : {_fmt(R['ess'], 6)}",
-              f"  Esforço máx |u|   : {_fmt(R['u_max'] * R['amp'])} V   (u em regime = "
-              f"{_fmt(R['u_regime'] * R['amp'])} V) para degrau de {R['amp']:g} UE"]
-        if "y_r" in R:
-            L += ["", "[ SETPOINT DO ARQUIVO ]",
-                  f"  Amostras          : {len(R['r_seq'])}  ({len(R['r_seq']) * R['T']:g} s)",
-                  f"  Esforço máx |u|   : {_fmt(R.get('u_max_r', np.nan))} V"]
-            if "soma_erro" in R:
-                L += [f"  SomaErro Σ(yd-y)² : {R['soma_erro']:.6g}"]
-        if R["metodo"] == "RF" and "margens_s" in R:
-            mo, ms, mz = R["margens_orig"], R["margens_s"], R["margens_s_zoh"]
-            L += ["", "[ MARGENS (BODE) ]",
-                  f"  Planta original   : MF = {_fmt(mo['Pm'], 2)}° em ωc = {_fmt(mo['Wcp'])} rad/s, "
-                  f"MG = {_fmt(mo['Gm_dB'], 2)} dB",
-                  f"  Compensado (cont.): MF = {_fmt(ms['Pm'], 2)}° em ωc = {_fmt(ms['Wcp'])} rad/s, "
-                  f"MG = {_fmt(ms['Gm_dB'], 2)} dB",
-                  f"  Compensado + ZOH  : MF = {_fmt(mz['Pm'], 2)}°, MG = {_fmt(mz['Gm_dB'], 2)} dB"]
-            if "info_cont" in R:
-                ic = R["info_cont"]
-                L += [f"  Contínuo (teórico): PO = {_fmt(ic['Overshoot'], 2)} %, tp = {_fmt(ic['PeakTime'])} s, "
-                      f"ts = {_fmt(ic['SettlingTime'])} s"]
-        if len(R["candidatos"]) > 1:
-            L += ["", "[ VARIANTES AVALIADAS ]  (a de menor custo é usada se a clássica falhar)"]
-            for c in R["candidatos"]:
-                if "falha" in c:
-                    L += [f"  - {c['rotulo']}: inviável ({c['falha']})"]
-                    continue
-                ci = c["info"]
-                marca = "  <== usada" if c is R["escolhido"] else ""
-                if c["estavel"]:
-                    L += [f"  - {c['rotulo']}: PO = {_fmt(ci['Overshoot'], 2)} %, tp = {_fmt(ci['PeakTime'], 3)} s, "
-                          f"ts = {_fmt(ci['SettlingTime'], 3)} s, custo = {c['custo']:.3f}{marca}"]
-                else:
-                    L += [f"  - {c['rotulo']}: instável{marca}"]
-        if R["avisos"]:
-            L += ["", "[ AVISOS ]"] + ["  • " + a for a in R["avisos"]]
         self.txt_mem.delete("1.0", tk.END)
-        self.txt_mem.insert("1.0", "\n".join(L))
+        self.txt_mem.insert("1.0", relatorio(R))
 
     def _mostra_graficos(self, R):
         fig = self.fig
